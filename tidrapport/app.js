@@ -19,6 +19,13 @@
 
 // ---------- 1. Konfiguration ----------
 const KLEER_URL = 'https://my.kleer.se';
+
+/* Fyll i dessa två om du vill slippa mata in dem på varje enhet – då är appen
+   förkonfigurerad och du behöver bara logga in. Publishable-nyckeln är gjord för
+   att ligga i frontend; det är Row Level Security som skyddar datan.
+   Lämna tomma för att i stället ange dem under Inställningar. */
+const SUPABASE_URL = 'https://cfnpvlpaqlrroquxwekg.supabase.co';   // t.ex. 'https://abcdefgh.supabase.co'
+const SUPABASE_KEY = 'sb_publishable_1ywUPhN6yd8Pv2B2oh8wKA_G0tK9ep6';   // t.ex. 'sb_publishable_...'
 const LS_DATA = 'tidrapport.data.v1';
 const LS_OUTBOX = 'tidrapport.outbox.v1';
 const LS_CFG = 'tidrapport.config.v1';
@@ -76,7 +83,9 @@ function saveLocal() {
   catch (e) { toast('Kunde inte spara lokalt: ' + e.message); }
 }
 
-const getCfg = () => { try { return JSON.parse(localStorage.getItem(LS_CFG) || 'null'); } catch { return null; } };
+const storedCfg = () => { try { return JSON.parse(localStorage.getItem(LS_CFG) || 'null'); } catch { return null; } };
+/** Konfiguration från Inställningar, annars den inbyggda i toppen av filen. */
+const getCfg = () => storedCfg() || (SUPABASE_URL && SUPABASE_KEY ? { url: SUPABASE_URL, anonKey: SUPABASE_KEY, builtin: true } : null);
 
 /* --- Outbox: ändringar som ännu inte nått Supabase ---
    { t: 'clients'|'projects'|'entries'|'invoices', a: 'up'|'del', row?, id? } */
@@ -552,9 +561,14 @@ function renderMonths(v) {
 }
 
 /* --- Inställningar --- */
+const cfgFormHtml = (url) => `
+  <label class="field">Project URL<input id="sbUrl" placeholder="https://xxxx.supabase.co" value="${esc(url)}" autocapitalize="off" /></label>
+  <label class="field">Publishable key (eller anon key)<input id="sbKey" placeholder="sb_publishable_… eller eyJ…" value="" autocapitalize="off" /></label>
+  <button class="btn primary" id="sbSave">Spara och anslut</button>`;
+
 function renderSettings(v) {
   const defaultId = clientById(ui.defaultClientId) ? ui.defaultClientId : (activeClients()[0]?.id ?? null);
-  const cfg = getCfg() || { url: '', anonKey: '' };
+  const cfg = getCfg();
 
   v.innerHTML = `
   <div class="card stack">
@@ -602,20 +616,18 @@ function renderSettings(v) {
 
   <div class="card stack">
     <div><p class="eyebrow">Databas</p><h2>Supabase</h2></div>
-    ${!cfg.url ? `
-      <p class="small muted" style="margin:0">Kör <code>supabase-schema.sql</code> i ditt Supabase-projekt och klistra in Project URL och anon key från <i>Project Settings → API</i>. Se README.</p>
-      <label class="field">Project URL<input id="sbUrl" placeholder="https://xxxx.supabase.co" value="" autocapitalize="off" /></label>
-      <label class="field">Anon key<input id="sbKey" placeholder="eyJ..." value="" autocapitalize="off" /></label>
-      <button class="btn primary" id="sbSave">Spara och anslut</button>
+    ${!cfg ? `
+      <p class="small muted" style="margin:0">Kör <code>supabase-schema.sql</code> i ditt Supabase-projekt. Project URL och nyckel hittar du via knappen <b>Connect</b> högst upp i dashboarden, eller under <i>Project Settings → API Keys</i>.</p>
+      ${cfgFormHtml('')}
     ` : !session ? `
-      <div class="small muted">Ansluten till <code>${esc(cfg.url.replace('https://', ''))}</code></div>
+      <div class="small muted">Ansluten till <code>${esc(cfg.url.replace('https://', ''))}</code>${cfg.builtin ? ' <span class="badge">från app.js</span>' : ''}</div>
       <label class="field">E-post<input id="authEmail" type="email" autocomplete="username" autocapitalize="off" placeholder="du@melago.se" /></label>
       <label class="field">Lösenord<input id="authPass" type="password" autocomplete="current-password" placeholder="minst 6 tecken" /></label>
       <div class="row wrap">
         <button class="btn primary" id="loginBtn">Logga in</button>
         <button class="btn" id="signupBtn">Skapa konto</button>
       </div>
-      <button class="btn ghost sm" id="sbClear">Byt Supabase-projekt</button>
+      <details><summary>Byt Supabase-projekt</summary><div class="stack" style="margin-top:.6rem">${cfgFormHtml(cfg.builtin ? '' : cfg.url)}${storedCfg() ? '<button class="btn ghost sm" id="sbClear">Återställ till app.js</button>' : ''}</div></details>
     ` : `
       <div class="row between">
         <div><div style="font-weight:500">${esc(session.user.email)}</div><div class="small muted">${outbox.length ? `${plural(outbox.length, 'ändring', 'ändringar')} väntar på att skickas` : 'Allt synkat'}</div></div>
@@ -679,7 +691,7 @@ function renderSettings(v) {
   // Supabase
   $('#sbSave') && ($('#sbSave').onclick = async () => {
     const url = $('#sbUrl').value.trim().replace(/\/+$/, ''), anonKey = $('#sbKey').value.trim();
-    if (!url || !anonKey) return toast('Fyll i både URL och anon key');
+    if (!url || !anonKey) return toast('Fyll i både URL och nyckel');
     localStorage.setItem(LS_CFG, JSON.stringify({ url, anonKey }));
     await initSupabase(); render(); toast('Ansluten – logga in för att synka');
   });

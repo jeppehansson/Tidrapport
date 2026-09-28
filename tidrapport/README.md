@@ -58,8 +58,13 @@ köade ändringar skickats först.
    så att bara din inloggade användare når dina rader.
 3. **Authentication → Sign In / Providers → Email**: låt e-post vara påslaget.
    Stäng gärna av *Confirm email* medan du sätter upp, så slipper du bekräftelsemejlet.
-4. **Project Settings → API**: kopiera *Project URL* och *anon public* key.
-5. I appen: **Inställningar → Supabase** → klistra in URL och anon key → *Spara och anslut*
+4. Klicka **Connect** högst upp i dashboarden (eller gå till **Project Settings → API Keys**)
+   och kopiera *Project URL* och *publishable key* (`sb_publishable_…`). Har projektet en
+   äldre `anon`-nyckel (`eyJ…`) fungerar den också, men den fasas ut av Supabase vid
+   utgången av 2026.
+5. I appen: **Inställningar → Supabase** → klistra in URL och nyckel → *Spara och anslut*
+   (alternativt: fyll i `SUPABASE_URL` och `SUPABASE_KEY` högst upp i `app.js` och pusha –
+   då är alla enheter förkonfigurerade och du behöver bara logga in)
    → fyll i e-post och lösenord → **Skapa konto** (första gången) eller **Logga in**.
 6. Har du redan timmar lokalt frågar appen om de ska laddas upp. Svara ja.
 7. På telefonen: samma sak, men **Logga in** med samma konto. Nu ser båda enheterna samma data.
@@ -67,8 +72,9 @@ köade ändringar skickats först.
 > **Stäng av registrering när du skapat ditt konto:** Authentication → Sign In / Providers →
 > Email → slå av *Allow new users to sign up*. Då kan ingen annan skapa konto i ditt projekt.
 
-Anon-nyckeln är gjord för att ligga i frontend – det är RLS-policyerna som skyddar datan,
-inte nyckeln. Utan inloggning returnerar den noll rader.
+Publishable-nyckeln är gjord för att ligga i frontend – det är RLS-policyerna som skyddar
+datan, inte nyckeln. Utan inloggning returnerar den noll rader. Blanda aldrig in
+`sb_secret_…` eller `service_role` i appen; de går förbi RLS.
 
 ## 2. Importera september från Excel
 
@@ -109,6 +115,9 @@ Stör "Powered by Netlify"-badgen längst ned till höger? Stäng av den under
 
 ## 5. Anpassa
 
+- **Förkonfigurerad Supabase**: `SUPABASE_URL` och `SUPABASE_KEY` högst upp i `app.js`.
+  Nycklarna hör inte hemma i Netlifys miljövariabler – appen byggs inte, så de når aldrig
+  webbläsaren. Publishable-nyckeln är gjord för att ligga i frontend.
 - **Standardkund/timpris** vid första start: `DEFAULT_CLIENT` högst upp i `app.js`.
 - **Kleer-länk**: `KLEER_URL` i `app.js`.
 - **Snabbval för timmar**: `QUICK_HOURS` i `app.js`.
