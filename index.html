@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Tidrapport</title>
+  <meta name="description" content="Enkel tidrapportering för konsultuppdrag – logga timmar dagligen, rapportera i Kleer på fredagar." />
+  <meta name="theme-color" content="#151719" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Tidrapport" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1 class="brand"><img src="icons/melago-logo.png" alt="Melago" /><span>Tidrapport</span></h1>
+      <div class="topbar-right" id="syncStatus" title="Lagring">Lokalt</div>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main id="view" class="view"></main>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-tab="today" class="tab active">
+      <span class="tab-icon">✎</span><span>Registrera</span>
+    </button>
+    <button data-tab="report" class="tab">
+      <span class="tab-icon">↥</span><span>Rapportera</span>
+    </button>
+    <button data-tab="months" class="tab">
+      <span class="tab-icon">▦</span><span>Översikt</span>
+    </button>
+    <button data-tab="settings" class="tab">
+      <span class="tab-icon">⚙</span><span>Inställningar</span>
+    </button>
+  </nav>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
