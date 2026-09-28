@@ -4,9 +4,9 @@ Mobilanpassad webbapp (PWA) för att logga konsulttimmar dagligen och rapportera
 [my.kleer.se](https://my.kleer.se) varje fredag – samt sista arbetsdagen i månaden när
 månadsbrytet infaller mitt i veckan. Ersätter Excel-arket `Timereport.xlsx`.
 
-Ingen byggkedja, ingen databas: ren HTML, CSS och JavaScript. Öppna `index.html` och
-redigera direkt. All data ligger i webbläsaren (localStorage); synk mellan enheter är
-valfri och görs med Netlify Blobs.
+Ingen byggkedja: ren HTML, CSS och JavaScript. Data ligger i en Supabase-databas så att
+mobil och dator visar samma timmar, med en lokal kopia i webbläsaren så att appen fungerar
+även utan täckning.
 
 ## Funktioner
 
@@ -17,100 +17,95 @@ valfri och görs med Netlify Blobs.
 - **Översikt** – timmar och belopp per månad och år, per kund och projekt, bock för
   *Faktura betald*, export till CSV och JSON-säkerhetskopia.
 - **Inställningar** – kunder med timpris (★ = standardkund), projekt per kund med valfritt
-  eget timpris, säkerhetskopia/import, valfri synk.
+  eget timpris, Supabase-inloggning, säkerhetskopia och import.
 - **Påminnelsebanner** på fredagar och sista arbetsdagen i månaden när något är orapporterat.
-- Installerbar på hemskärmen (iOS: Dela → *Lägg till på hemskärmen*; Android: *Installera app*)
-  och fungerar offline.
+- Installerbar på hemskärmen (iOS: Dela → *Lägg till på hemskärmen*; Android: *Installera app*).
+
+## Så fungerar lagringen
+
+Appen skriver **alltid lokalt först** och lägger ändringen i en kö. Kön skickas till Supabase
+så fort du har nät och är inloggad. Statusen syns uppe till höger:
+
+| Text | Betyder |
+|---|---|
+| `Lokalt` | Ingen Supabase konfigurerad – allt ligger bara i den här webbläsaren |
+| `Ej inloggad` | Databasen är konfigurerad men du måste logga in |
+| `Synkad` | Allt är uppe i databasen |
+| `Väntar (n)` | n ändringar väntar på att skickas |
+| `Offline` | Ingen nätverksanslutning – ändringarna skickas när nätet kommer tillbaka |
+
+Vid start hämtas allt från databasen och ersätter den lokala kopian, efter att eventuella
+köade ändringar skickats först.
 
 ## Filer
 
 | Fil | Innehåll |
 |---|---|
 | `index.html` | Skal och flikar |
-| `style.css` | All stil i Melago-stil (melago.se): mörk header/footer, Noto Sans, 4 px hörn. Tokens under `:root` |
-| `app.js` | All logik: hjälpfunktioner → lagring → state → vyer → uppstart |
-| `netlify/functions/sync.mjs` | Valfri synk-endpoint (`/api/sync`) ovanpå Netlify Blobs |
+| `style.css` | All stil i Melago-stil (melago.se). Tokens under `:root` |
+| `app.js` | All logik: hjälpfunktioner → lagring/synk → state → vyer → uppstart |
+| `supabase-schema.sql` | Tabeller, index, Row Level Security och en vy – körs en gång |
 | `import-september-2026.json` | September 2026 från Excel-arket (87 h), redo att importera |
 | `manifest.webmanifest`, `sw.js`, `icons/` | PWA-delarna + Melago-logotypen |
-| `netlify.toml`, `package.json` | Deploy-konfiguration |
+| `netlify.toml` | Deploy-konfiguration |
 
-## 1. Kör lokalt
+## 1. Sätt upp Supabase
+
+1. Skapa ett projekt på [supabase.com](https://supabase.com) – välj regionen **EU (Frankfurt)**
+   eller **EU (Stockholm)** så att datan stannar inom EU.
+2. **SQL Editor → New query** → klistra in hela `supabase-schema.sql` → **Run**.
+   Det skapar `clients`, `projects`, `entries`, `invoices` med Row Level Security påslaget,
+   så att bara din inloggade användare når dina rader.
+3. **Authentication → Sign In / Providers → Email**: låt e-post vara påslaget.
+   Stäng gärna av *Confirm email* medan du sätter upp, så slipper du bekräftelsemejlet.
+4. **Project Settings → API**: kopiera *Project URL* och *anon public* key.
+5. I appen: **Inställningar → Supabase** → klistra in URL och anon key → *Spara och anslut*
+   → fyll i e-post och lösenord → **Skapa konto** (första gången) eller **Logga in**.
+6. Har du redan timmar lokalt frågar appen om de ska laddas upp. Svara ja.
+7. På telefonen: samma sak, men **Logga in** med samma konto. Nu ser båda enheterna samma data.
+
+> **Stäng av registrering när du skapat ditt konto:** Authentication → Sign In / Providers →
+> Email → slå av *Allow new users to sign up*. Då kan ingen annan skapa konto i ditt projekt.
+
+Anon-nyckeln är gjord för att ligga i frontend – det är RLS-policyerna som skyddar datan,
+inte nyckeln. Utan inloggning returnerar den noll rader.
+
+## 2. Importera september från Excel
+
+**Inställningar → Säkerhetskopia & import → Importera JSON** → välj `import-september-2026.json`.
+
+Innehåller 16–30 september 2026, 87 h totalt (= samma summa som Excel-arket, 109 620 kr
+à 1 260 kr/h). Dagarna t.o.m. fredag 25 september är förbockade som rapporterade i Kleer;
+28–30 september ligger kvar som orapporterade. Justera med ↶ under *Rapportera* om det inte
+stämmer. Importen matchar kunder och projekt på **namn**, så du kan köra den flera gånger
+utan att få dubbletter.
+
+## 3. Kör lokalt
 
 ```bash
 cd tidrapport
 python3 -m http.server 8080     # eller npx serve .
 ```
 
-Öppna <http://localhost:8080>. (Service workern kräver http/https, inte `file://`.)
+Öppna <http://localhost:8080>. Lägg till `http://localhost:8080` under
+**Authentication → URL Configuration → Redirect URLs** i Supabase om du vill logga in lokalt.
 
-## 2. Lägg i GitHub och deploya automatiskt
+## 4. Publicera (GitHub Desktop + Netlify)
 
-Engångsuppsättning – därefter deployar varje `git push` automatiskt.
+1. GitHub Desktop: **File → Add local repository…** → välj mappen → klicka *create a repository*
+   → **Commit to main** → **Publish repository** (kryssa i *Keep this code private*).
+2. Netlify: **Add new site → Import an existing project → GitHub** → välj repot → **Deploy**.
+   `netlify.toml` anger `publish = "."`, inget byggkommando behövs.
+3. Framåt: ändra filer → Commit to main → Push origin. Netlify deployar automatiskt.
 
-```bash
-cd tidrapport
-git init -b main
-git add .
-git commit -m "Tidrapport: första versionen"
-```
+Lägg till din Netlify-adress under **Authentication → URL Configuration** i Supabase
+(*Site URL* och *Redirect URLs*).
 
-Skapa ett **privat** repo på <https://github.com/new> (t.ex. `tidrapport`, utan README),
-kopiera dess URL och kör:
+> Höj `CACHE`-versionen i `sw.js` (t.ex. `tidrapport-v5`) när du ändrat `app.js` eller
+> `style.css`, annars kan hemskärms-appen ligga kvar på den gamla versionen.
 
-```bash
-git remote add origin https://github.com/<ditt-användarnamn>/tidrapport.git
-git push -u origin main
-```
-
-Koppla sedan repot i Netlify: **Add new site → Import an existing project → GitHub** → välj
-repot. Netlify läser `netlify.toml`, så inget byggkommando behövs (`publish = "."`).
-Klicka **Deploy**. Sätt gärna ett eget namn under *Site configuration → Change site name*,
-t.ex. `melago-tid.netlify.app`.
-
-Framåt:
-
-```bash
-git add -A && git commit -m "Beskrivning av ändringen" && git push
-```
-
-Netlify bygger om på någon minut. Varje deploy sparas, så du kan rulla tillbaka i
-*Deploys*-fliken om något blir fel. Ändrar du filer direkt i GitHubs webbeditor (går bra
-från mobilen) deployar det också automatiskt.
-
-> Höj `CACHE`-versionen i `sw.js` när du ändrat något – annars kan installerade
-> hemskärms-appar ligga kvar på den gamla versionen.
-
-## 3. Importera september från Excel
-
-Öppna appen → **Inställningar → Säkerhetskopia & import → Importera JSON** → välj
-`import-september-2026.json`.
-
-Innehåller 16–30 september 2026, 87 h totalt (= samma summa som Excel-arket, 109 620 kr
-à 1 260 kr/h). Dagarna t.o.m. fredag 25 september är förbockade som rapporterade i Kleer;
-28–30 september ligger kvar som orapporterade. Justera med ↶ under *Rapportera* om det
-inte stämmer.
-
-Import matchar kunder och projekt på **namn**, så du kan importera samma fil flera gånger
-utan att få dubbletter.
-
-## 4. Synk mellan mobil och dator (valfritt)
-
-Utan detta steg lever datan bara i den webbläsare du använder. Slår du på synk speglas hela
-datamängden som en JSON-klump via din egen Netlify-sajt – ingen databas behövs.
-
-1. I Netlify: **Site configuration → Environment variables → Add a variable**
-   - Key: `SYNC_TOKEN`
-   - Value: en lång slumpsträng, t.ex. från `openssl rand -hex 24`
-2. Deploya om (Netlify gör det automatiskt vid nästa push, eller *Trigger deploy*).
-3. I appen: **Inställningar → Synk mellan enheter** → klistra in samma sträng → *Slå på synk*.
-   Gör samma sak på telefonen.
-
-Nyast vinner: appen hämtar molnversionen vid start om den är nyare, och skickar upp dina
-ändringar strax efter att du sparat. Tänkt för en användare på ett par enheter, inte för
-samtidig redigering på två enheter på en gång.
-
-Vill du hoppa över synken helt: ta bort mappen `netlify/` och `package.json` – appen
-fungerar likadant, och du tar säkerhetskopia via *Inställningar → Ladda ner säkerhetskopia*.
+Stör "Powered by Netlify"-badgen längst ned till höger? Stäng av den under
+**Project configuration → General → Powered by Netlify badge**.
 
 ## 5. Anpassa
 
@@ -128,11 +123,16 @@ fungerar likadant, och du tar säkerhetskopia via *Inställningar → Ladda ner 
 clients   id, name, hourly_rate, active
 projects  id, client_id, name, hourly_rate (null = kundens), active
 entries   id, date (YYYY-MM-DD), client_id, project_id (null ok), hours, note, reported_at
-          -- unik per dag + kund + projekt
 invoices  id, client_id, month (YYYY-MM), paid, paid_at
-updated_at  ISO-tid för senaste ändringen (används av synken)
 ```
 
-Belopp = timmar × projektets timpris om satt, annars kundens.
-`reported_at` sätts när du markerar en vecka som rapporterad i Kleer och styr både bannern
-och listan under *Rapportera*.
+En tidpost per dag, kund och projekt (två partiella unik-index i databasen håller det rent
+även om två enheter skapar samma dag var för sig). Belopp = timmar × projektets timpris om
+satt, annars kundens. `reported_at` sätts när du markerar en vecka som rapporterad i Kleer
+och styr både bannern och listan under *Rapportera*.
+
+Vyn `weekly_summary` finns i databasen om du vill göra egna SQL-frågor:
+
+```sql
+select * from weekly_summary where iso_year = 2026 order by iso_week;
+```

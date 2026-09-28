@@ -1,10 +1,6 @@
-# Netlify – statisk sajt utan byggsteg + en liten function för synk (valfri).
+# Netlify – statisk sajt, inget byggsteg.
 [build]
   publish = "."
-  functions = "netlify/functions"
-
-[functions]
-  node_bundler = "esbuild"
 
 [[headers]]
   for = "/*"

@@ -89,6 +89,7 @@ button { font: inherit; }
   max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .topbar-right.online { color: #fff; border-color: rgba(255,255,255,.6); }
+.topbar-right.warn { color: #f0c987; border-color: rgba(240,201,135,.5); }
 
 /* Banner */
 .banner {

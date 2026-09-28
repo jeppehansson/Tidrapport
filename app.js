@@ -1,13 +1,17 @@
 /* ==================================================================
    Tidrapport – app.js
-   Ren vanilla JS, inget byggsteg, ingen databas.
-   All data ligger i webbläsaren (localStorage). Vill du synka mellan
-   mobil och dator slår du på Netlify-synk under Inställningar – då
-   speglas samma JSON via /api/sync (Netlify Blobs).
+   Ren vanilla JS, inget byggsteg.
+
+   Lagring: lokal cache (localStorage) + Supabase i bakgrunden.
+   - Appen läser och skriver alltid lokalt först → snabb och fungerar offline.
+   - Varje ändring läggs i en kö (outbox) som skickas till Supabase så fort
+     det finns nät och du är inloggad.
+   - Vid start hämtas allt från Supabase och ersätter den lokala cachen.
+   Utan Supabase-konfiguration fungerar allt precis som förut, bara lokalt.
 
    Innehåll:
      1. Konfiguration & hjälpfunktioner (datum, format)
-     2. Lagring (localStorage + valfri Netlify-synk)
+     2. Lokal cache, outbox och Supabase-synk
      3. State, härledda beräkningar & mutationer
      4. Vyer (Registrera, Rapportera, Översikt, Inställningar)
      5. Banner, toast, navigation, uppstart
@@ -16,11 +20,11 @@
 // ---------- 1. Konfiguration ----------
 const KLEER_URL = 'https://my.kleer.se';
 const LS_DATA = 'tidrapport.data.v1';
-const LS_SYNC = 'tidrapport.sync.v1';
+const LS_OUTBOX = 'tidrapport.outbox.v1';
+const LS_CFG = 'tidrapport.config.v1';
 const LS_UI = 'tidrapport.ui.v1';
 const DEFAULT_CLIENT = { name: 'Riksbyggen', hourly_rate: 1260 };   // skapas vid första start
 const QUICK_HOURS = [4, 6, 7.5, 8, 9, 10];
-const SYNC_URL = '/api/sync';
 
 const MONTHS = ['Januari','Februari','Mars','April','Maj','Juni','Juli','Augusti','September','Oktober','November','December'];
 const MONTHS_SHORT = ['jan','feb','mar','apr','maj','jun','jul','aug','sep','okt','nov','dec'];
@@ -55,59 +59,144 @@ const fmtHours = (h) => (Math.round(h * 100) / 100).toLocaleString('sv-SE', { ma
 const fmtSEK = (n) => Math.round(n).toLocaleString('sv-SE') + ' kr';
 
 // ---------- 2. Lagring ----------
-/* Datamodell (en enda JSON-klump, sparas i localStorage)
+/* Datamodell – samma fält som tabellerna i Supabase
    clients:  { id, name, hourly_rate, active }
    projects: { id, client_id, name, hourly_rate (null = kundens), active }
-   entries:  { id, date, client_id, project_id (null ok), hours, note, reported_at }  (unik per date+client+project)
-   invoices: { id, client_id, month, paid, paid_at }                                   (unik per client+month)
-   updated_at: ISO-tid för senaste ändringen – används av synken
+   entries:  { id, date, client_id, project_id (null ok), hours, note, reported_at }
+   invoices: { id, client_id, month, paid, paid_at }
 */
-const emptyData = () => ({ clients: [], projects: [], entries: [], invoices: [], updated_at: null });
+const emptyData = () => ({ clients: [], projects: [], entries: [], invoices: [] });
 
 function loadLocal() {
   try { return { ...emptyData(), ...JSON.parse(localStorage.getItem(LS_DATA) || '{}') }; }
   catch { return emptyData(); }
 }
-function saveLocal(data) {
-  try { localStorage.setItem(LS_DATA, JSON.stringify(data)); }
+function saveLocal() {
+  try { localStorage.setItem(LS_DATA, JSON.stringify(state)); }
   catch (e) { toast('Kunde inte spara lokalt: ' + e.message); }
 }
 
-const syncCfg = () => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || 'null'); } catch { return null; } };
-const syncOn = () => !!syncCfg()?.token;
+const getCfg = () => { try { return JSON.parse(localStorage.getItem(LS_CFG) || 'null'); } catch { return null; } };
 
-/* Netlify-synk: hela datamängden skickas som en JSON-klump.
-   Nyast vinner (updated_at avgör). Fungerar bra för en användare på
-   ett par enheter – inte tänkt för samtidig redigering. */
-async function syncPush(silent = true) {
-  const cfg = syncCfg(); if (!cfg?.token) return;
-  const res = await fetch(SYNC_URL, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.token}` },
-    body: JSON.stringify(state),
-  });
-  if (!res.ok) throw new Error(res.status === 401 ? 'Fel synknyckel' : `Synk misslyckades (${res.status})`);
-  if (!silent) toast('Synkat');
-}
-async function syncPull() {
-  const cfg = syncCfg(); if (!cfg?.token) return null;
-  const res = await fetch(SYNC_URL, { headers: { authorization: `Bearer ${cfg.token}` } });
-  if (!res.ok) throw new Error(res.status === 401 ? 'Fel synknyckel' : `Synk misslyckades (${res.status})`);
-  return await res.json();
-}
-let pushTimer = null;
-function schedulePush() {
-  if (!syncOn()) return;
-  clearTimeout(pushTimer);
-  pushTimer = setTimeout(() => { syncPush().catch((e) => toast(e.message)); }, 1200);
+/* --- Outbox: ändringar som ännu inte nått Supabase ---
+   { t: 'clients'|'projects'|'entries'|'invoices', a: 'up'|'del', row?, id? } */
+let outbox = (() => { try { return JSON.parse(localStorage.getItem(LS_OUTBOX) || '[]'); } catch { return []; } })();
+const saveOutbox = () => { try { localStorage.setItem(LS_OUTBOX, JSON.stringify(outbox)); } catch {} };
+
+let sb = null;          // Supabase-klient
+let session = null;     // inloggad session
+let flushing = false;
+let syncState = 'local';  // 'local' | 'ok' | 'pending' | 'offline' | 'error'
+
+const cloudReady = () => !!(sb && session);
+
+function queue(op) {
+  if (!getCfg()) return;              // ingen Supabase konfigurerad – bara lokalt
+  outbox.push(op); saveOutbox();
+  updateSyncPill();
+  flush();
 }
 
-/** Sparar state lokalt + (om påslaget) till Netlify. Anropas efter varje ändring. */
-function persist() {
-  state.updated_at = new Date().toISOString();
-  saveLocal(state);
-  schedulePush();
+/** Skickar en kö-post till Supabase. */
+async function applyOp(op) {
+  if (op.a === 'del') {
+    const { error } = await sb.from(op.t).delete().eq('id', op.id);
+    if (error) throw error;
+    return;
+  }
+  const { error } = await sb.from(op.t).upsert(op.row);
+  if (!error) return;
+
+  // Krock på unik-index: samma dag/kund/projekt finns redan i molnet med ett
+  // annat id (kan hända om två enheter skapat samma dag var för sig).
+  // Vi uppdaterar molnets rad och tar över dess id lokalt.
+  if (op.t === 'entries' && (error.code === '23505' || /duplicate key/i.test(error.message || ''))) {
+    const r = op.row;
+    let q = sb.from('entries').select('id').eq('date', r.date).eq('client_id', r.client_id);
+    q = r.project_id ? q.eq('project_id', r.project_id) : q.is('project_id', null);
+    const { data } = await q.limit(1);
+    const serverId = data?.[0]?.id;
+    if (serverId) {
+      const { error: e2 } = await sb.from('entries').update({ hours: r.hours, note: r.note, reported_at: r.reported_at }).eq('id', serverId);
+      if (e2) throw e2;
+      const local = state.entries.find((e) => e.id === r.id);
+      if (local) local.id = serverId;
+      state.entries = state.entries.filter((e, i, arr) => arr.findIndex((x) => x.id === e.id) === i);
+      saveLocal();
+      return;
+    }
+  }
+  throw error;
 }
+
+/** Tömmer kön mot Supabase. Körs efter varje ändring, vid start och när nätet kommer tillbaka. */
+async function flush(silent = true) {
+  if (!cloudReady() || flushing) return;
+  if (!navigator.onLine) { setSync('offline'); return; }
+  if (outbox.length === 0) { setSync('ok'); return; }
+  flushing = true;
+  try {
+    while (outbox.length) {
+      await applyOp(outbox[0]);
+      outbox.shift(); saveOutbox(); updateSyncPill();
+    }
+    setSync('ok');
+    if (!silent) toast('Synkat med Supabase');
+  } catch (e) {
+    console.error(e);
+    setSync('pending');
+    if (!silent) toast('Kunde inte synka: ' + (e.message || e));
+  } finally { flushing = false; }
+}
+
+/** Hämtar allt från Supabase och ersätter den lokala cachen. */
+async function pull() {
+  const [c, p, e, i] = await Promise.all([
+    sb.from('clients').select('*').order('name'),
+    sb.from('projects').select('*').order('name'),
+    sb.from('entries').select('*').order('date'),
+    sb.from('invoices').select('*'),
+  ]);
+  for (const r of [c, p, e, i]) if (r.error) throw r.error;
+  state = {
+    clients: c.data.map((x) => ({ ...x, hourly_rate: Number(x.hourly_rate) })),
+    projects: p.data.map((x) => ({ ...x, hourly_rate: x.hourly_rate == null ? null : Number(x.hourly_rate) })),
+    entries: e.data.map((x) => ({ ...x, hours: Number(x.hours) })),
+    invoices: i.data,
+  };
+  saveLocal();
+}
+
+/** Lägger hela den lokala datan i kön – används första gången du loggar in. */
+function uploadAll() {
+  for (const c of state.clients) queue({ t: 'clients', a: 'up', row: clientRow(c) });
+  for (const p of state.projects) queue({ t: 'projects', a: 'up', row: projectRow(p) });
+  for (const e of state.entries) queue({ t: 'entries', a: 'up', row: entryRow(e) });
+  for (const i of state.invoices) queue({ t: 'invoices', a: 'up', row: invoiceRow(i) });
+}
+
+// Rad-former som matchar tabellerna (user_id sätts av databasen)
+const clientRow = (c) => ({ id: c.id, name: c.name, hourly_rate: c.hourly_rate, active: c.active !== false });
+const projectRow = (p) => ({ id: p.id, client_id: p.client_id, name: p.name, hourly_rate: p.hourly_rate ?? null, active: p.active !== false });
+const entryRow = (e) => ({ id: e.id, date: e.date, client_id: e.client_id, project_id: e.project_id ?? null, hours: e.hours, note: e.note ?? '', reported_at: e.reported_at ?? null });
+const invoiceRow = (i) => ({ id: i.id, client_id: i.client_id, month: i.month, paid: !!i.paid, paid_at: i.paid_at ?? null });
+
+function setSync(s) { syncState = s; updateSyncPill(); }
+function updateSyncPill() {
+  const el = $('#syncStatus'); if (!el) return;
+  const n = outbox.length;
+  const label = !getCfg() ? 'Lokalt'
+    : !session ? 'Ej inloggad'
+    : syncState === 'offline' ? 'Offline' + (n ? ` (${n})` : '')
+    : syncState === 'pending' || n ? `Väntar${n ? ` (${n})` : ''}`
+    : 'Synkad';
+  el.textContent = label;
+  el.classList.toggle('online', label === 'Synkad');
+  el.classList.toggle('warn', label.startsWith('Väntar') || label.startsWith('Offline'));
+}
+
+window.addEventListener('online', () => { setSync('pending'); flush(); });
+window.addEventListener('offline', () => setSync('offline'));
 
 // ---------- 3. State ----------
 let state = emptyData();
@@ -140,92 +229,90 @@ function reminder() {
   return { isFriday, isMonthEnd, due: (isFriday || isMonthEnd) && list.length > 0, hours: sumHours(list), count: list.length };
 }
 
-// ---------- Mutationer ----------
+// ---------- Mutationer (lokalt först, sedan kö mot Supabase) ----------
 function saveEntry({ date, client_id, project_id, hours, note }) {
   hours = Number(hours); project_id = project_id || null;
   let e = state.entries.find((x) => x.date === date && x.client_id === client_id && (x.project_id || null) === project_id);
   if (hours <= 0) {
-    if (e) { state.entries = state.entries.filter((x) => x.id !== e.id); persist(); toast('Post borttagen'); }
+    if (e) { state.entries = state.entries.filter((x) => x.id !== e.id); saveLocal(); queue({ t: 'entries', a: 'del', id: e.id }); toast('Post borttagen'); }
     return;
   }
   if (e) { e.hours = hours; e.note = note; }
-  else state.entries.push({ id: uid(), date, client_id, project_id, hours, note, reported_at: null });
-  persist();
+  else { e = { id: uid(), date, client_id, project_id, hours, note, reported_at: null }; state.entries.push(e); }
+  saveLocal(); queue({ t: 'entries', a: 'up', row: entryRow(e) });
   toast(`Sparat ${fmtHours(hours)} – ${longDate(date)}`);
 }
 function upsertClient(c) {
   const i = state.clients.findIndex((x) => x.id === c.id);
   if (i >= 0) state.clients[i] = c; else state.clients.push(c);
-  persist();
+  saveLocal(); queue({ t: 'clients', a: 'up', row: clientRow(c) });
 }
 function deleteClient(id) {
   state.clients = state.clients.filter((c) => c.id !== id);
   state.projects = state.projects.filter((p) => p.client_id !== id);
   state.entries = state.entries.filter((e) => e.client_id !== id);
   state.invoices = state.invoices.filter((i) => i.client_id !== id);
-  persist();
+  saveLocal(); queue({ t: 'clients', a: 'del', id });   // databasen kaskadraderar barnen
 }
 function upsertProject(p) {
   const i = state.projects.findIndex((x) => x.id === p.id);
   if (i >= 0) state.projects[i] = p; else state.projects.push(p);
-  persist();
+  saveLocal(); queue({ t: 'projects', a: 'up', row: projectRow(p) });
 }
 function deleteProject(id) {
   state.projects = state.projects.filter((p) => p.id !== id);
   state.entries = state.entries.filter((e) => e.project_id !== id);
-  persist();
+  saveLocal(); queue({ t: 'projects', a: 'del', id });
 }
 function setInvoicePaid(client_id, month, paid) {
   let inv = state.invoices.find((i) => i.client_id === client_id && i.month === month);
   if (!inv) { inv = { id: uid(), client_id, month, paid: false, paid_at: null }; state.invoices.push(inv); }
   inv.paid = paid; inv.paid_at = paid ? new Date().toISOString() : null;
-  persist();
+  saveLocal(); queue({ t: 'invoices', a: 'up', row: invoiceRow(inv) });
 }
 function markReported(ids) {
   const ts = new Date().toISOString();
-  for (const e of state.entries) if (ids.includes(e.id)) e.reported_at = ts;
-  persist();
+  for (const e of state.entries) if (ids.includes(e.id)) { e.reported_at = ts; queue({ t: 'entries', a: 'up', row: entryRow(e) }); }
+  saveLocal();
   toast(`${plural(ids.length, 'dag markerad', 'dagar markerade')} som rapporterade`);
 }
 function unmarkReported(ids) {
-  for (const e of state.entries) if (ids.includes(e.id)) e.reported_at = null;
-  persist();
+  for (const e of state.entries) if (ids.includes(e.id)) { e.reported_at = null; queue({ t: 'entries', a: 'up', row: entryRow(e) }); }
+  saveLocal();
 }
 
-/** Import av JSON-fil. Kunder och projekt matchas på namn så att
-    inget dubbleras, och tidposternas id:n skrivs om därefter. */
+/** Import av JSON-fil. Kunder och projekt matchas på namn så att inget dubbleras. */
 function importData(data) {
-  const clientMap = new Map();   // id i filen -> id i appen
-  const projectMap = new Map();
+  const clientMap = new Map(), projectMap = new Map();
   let added = 0, updated = 0;
 
   for (const c of data.clients ?? []) {
     const existing = state.clients.find((x) => x.name.trim().toLowerCase() === String(c.name).trim().toLowerCase());
     if (existing) clientMap.set(c.id, existing.id);
-    else { const n = { ...c, id: uid(), active: c.active !== false }; state.clients.push(n); clientMap.set(c.id, n.id); }
+    else { const n = { ...c, id: uid(), active: c.active !== false }; state.clients.push(n); clientMap.set(c.id, n.id); queue({ t: 'clients', a: 'up', row: clientRow(n) }); }
   }
   for (const p of data.projects ?? []) {
     const cid = clientMap.get(p.client_id) ?? p.client_id;
     const existing = state.projects.find((x) => x.client_id === cid && x.name.trim().toLowerCase() === String(p.name).trim().toLowerCase());
     if (existing) projectMap.set(p.id, existing.id);
-    else { const n = { ...p, id: uid(), client_id: cid, active: p.active !== false }; state.projects.push(n); projectMap.set(p.id, n.id); }
+    else { const n = { ...p, id: uid(), client_id: cid, active: p.active !== false }; state.projects.push(n); projectMap.set(p.id, n.id); queue({ t: 'projects', a: 'up', row: projectRow(n) }); }
   }
   for (const e of data.entries ?? []) {
     const client_id = clientMap.get(e.client_id) ?? e.client_id;
     const project_id = e.project_id ? (projectMap.get(e.project_id) ?? e.project_id) : null;
     if (!clientById(client_id)) continue;
     const existing = state.entries.find((x) => x.date === e.date && x.client_id === client_id && (x.project_id || null) === project_id);
-    if (existing) { Object.assign(existing, { hours: e.hours, note: e.note ?? existing.note, reported_at: e.reported_at ?? existing.reported_at }); updated++; }
-    else { state.entries.push({ id: uid(), date: e.date, client_id, project_id, hours: Number(e.hours), note: e.note ?? '', reported_at: e.reported_at ?? null }); added++; }
+    if (existing) { Object.assign(existing, { hours: Number(e.hours), note: e.note ?? existing.note, reported_at: e.reported_at ?? existing.reported_at }); updated++; queue({ t: 'entries', a: 'up', row: entryRow(existing) }); }
+    else { const n = { id: uid(), date: e.date, client_id, project_id, hours: Number(e.hours), note: e.note ?? '', reported_at: e.reported_at ?? null }; state.entries.push(n); added++; queue({ t: 'entries', a: 'up', row: entryRow(n) }); }
   }
   for (const i of data.invoices ?? []) {
     const cid = clientMap.get(i.client_id) ?? i.client_id;
     if (!clientById(cid)) continue;
     const existing = state.invoices.find((x) => x.client_id === cid && x.month === i.month);
-    if (existing) Object.assign(existing, { paid: i.paid, paid_at: i.paid_at });
-    else state.invoices.push({ ...i, id: uid(), client_id: cid });
+    if (existing) { Object.assign(existing, { paid: i.paid, paid_at: i.paid_at }); queue({ t: 'invoices', a: 'up', row: invoiceRow(existing) }); }
+    else { const n = { ...i, id: uid(), client_id: cid }; state.invoices.push(n); queue({ t: 'invoices', a: 'up', row: invoiceRow(n) }); }
   }
-  persist();
+  saveLocal();
   return { added, updated };
 }
 
@@ -235,8 +322,7 @@ function render() {
   renderBanner();
   const v = $('#view');
   ({ today: renderToday, report: renderReport, months: renderMonths, settings: renderSettings })[ui.tab](v);
-  $('#syncStatus').textContent = syncOn() ? 'Synkad' : 'Lokalt';
-  $('#syncStatus').classList.toggle('online', syncOn());
+  updateSyncPill();
 }
 
 const clientSelectHtml = (id, selected) => `<select id="${id}">${activeClients().map((c) => `<option value="${c.id}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`;
@@ -334,8 +420,7 @@ function renderToday(v) {
 /* --- Rapportera (Kleer) --- */
 function renderReport(v) {
   const r = reminder();
-  const list = unreported(); // t.o.m. idag
-  // Gruppera per vecka + månad så att månadsbryt mitt i veckan blir egna grupper
+  const list = unreported();
   const groups = new Map();
   for (const e of list) {
     const d = parseDate(e.date); const w = isoWeek(d);
@@ -469,7 +554,7 @@ function renderMonths(v) {
 /* --- Inställningar --- */
 function renderSettings(v) {
   const defaultId = clientById(ui.defaultClientId) ? ui.defaultClientId : (activeClients()[0]?.id ?? null);
-  const cfg = syncCfg() || { token: '' };
+  const cfg = getCfg() || { url: '', anonKey: '' };
 
   v.innerHTML = `
   <div class="card stack">
@@ -516,24 +601,43 @@ function renderSettings(v) {
   </div>
 
   <div class="card stack">
+    <div><p class="eyebrow">Databas</p><h2>Supabase</h2></div>
+    ${!cfg.url ? `
+      <p class="small muted" style="margin:0">Kör <code>supabase-schema.sql</code> i ditt Supabase-projekt och klistra in Project URL och anon key från <i>Project Settings → API</i>. Se README.</p>
+      <label class="field">Project URL<input id="sbUrl" placeholder="https://xxxx.supabase.co" value="" autocapitalize="off" /></label>
+      <label class="field">Anon key<input id="sbKey" placeholder="eyJ..." value="" autocapitalize="off" /></label>
+      <button class="btn primary" id="sbSave">Spara och anslut</button>
+    ` : !session ? `
+      <div class="small muted">Ansluten till <code>${esc(cfg.url.replace('https://', ''))}</code></div>
+      <label class="field">E-post<input id="authEmail" type="email" autocomplete="username" autocapitalize="off" placeholder="du@melago.se" /></label>
+      <label class="field">Lösenord<input id="authPass" type="password" autocomplete="current-password" placeholder="minst 6 tecken" /></label>
+      <div class="row wrap">
+        <button class="btn primary" id="loginBtn">Logga in</button>
+        <button class="btn" id="signupBtn">Skapa konto</button>
+      </div>
+      <button class="btn ghost sm" id="sbClear">Byt Supabase-projekt</button>
+    ` : `
+      <div class="row between">
+        <div><div style="font-weight:500">${esc(session.user.email)}</div><div class="small muted">${outbox.length ? `${plural(outbox.length, 'ändring', 'ändringar')} väntar på att skickas` : 'Allt synkat'}</div></div>
+        <button class="btn sm" id="logoutBtn">Logga ut</button>
+      </div>
+      <div class="row wrap">
+        <button class="btn" id="syncNow">Synka nu</button>
+        <button class="btn" id="pullBtn">Hämta från databasen</button>
+        <button class="btn ghost" id="uploadBtn">Ladda upp allt lokalt</button>
+      </div>
+      <p class="small muted" style="margin:0">Timmarna sparas direkt i mobilen och skickas till databasen i bakgrunden – du kan registrera utan täckning och det synkas när du får nät igen.</p>
+    `}
+  </div>
+
+  <div class="card stack">
     <div><p class="eyebrow">Data</p><h2>Säkerhetskopia & import</h2></div>
-    <p class="small muted" style="margin:0">All data ligger i den här webbläsaren. Ta en säkerhetskopia då och då – och innan du byter telefon.</p>
     <div class="row wrap">
       <button class="btn" id="backupBtn">Ladda ner säkerhetskopia</button>
       <label class="btn">Importera JSON<input type="file" id="importFile" accept="application/json" hidden /></label>
     </div>
-    <div class="small muted">${state.entries.length} tidposter · ${state.clients.length} kunder · ${state.projects.length} projekt${state.updated_at ? ` · senast ändrad ${new Date(state.updated_at).toLocaleString('sv-SE')}` : ''}</div>
-    <button class="btn danger" id="wipeBtn">Rensa all data</button>
-  </div>
-
-  <div class="card stack">
-    <div><p class="eyebrow">Valfritt</p><h2>Synk mellan enheter</h2></div>
-    <p class="small muted" style="margin:0">Utan synk lever datan bara i den här webbläsaren. Slår du på synk speglas allt via din Netlify-sajt (Netlify Blobs) så att mobil och dator visar samma timmar. Kräver att du satt <code>SYNC_TOKEN</code> i Netlify – se README.</p>
-    <label class="field">Synknyckel<input id="syncToken" type="password" placeholder="samma värde som SYNC_TOKEN" value="${esc(cfg.token)}" autocapitalize="off" /></label>
-    <div class="row wrap">
-      <button class="btn primary" id="syncSave">${syncOn() ? 'Uppdatera nyckel' : 'Slå på synk'}</button>
-      ${syncOn() ? '<button class="btn" id="syncNow">Synka nu</button><button class="btn ghost" id="syncOff">Stäng av</button>' : ''}
-    </div>
+    <div class="small muted">${plural(state.entries.length, 'tidpost', 'tidposter')} · ${plural(state.clients.length, 'kund', 'kunder')} · ${plural(state.projects.length, 'projekt', 'projekt')}</div>
+    <button class="btn danger" id="wipeBtn">Rensa lokalt</button>
   </div>
   <div class="footer-note">Melago AB · <a href="${KLEER_URL}" target="_blank" rel="noopener">my.kleer.se</a></div>`;
 
@@ -572,6 +676,37 @@ function renderSettings(v) {
     render(); toast('Projekt sparat');
   };
 
+  // Supabase
+  $('#sbSave') && ($('#sbSave').onclick = async () => {
+    const url = $('#sbUrl').value.trim().replace(/\/+$/, ''), anonKey = $('#sbKey').value.trim();
+    if (!url || !anonKey) return toast('Fyll i både URL och anon key');
+    localStorage.setItem(LS_CFG, JSON.stringify({ url, anonKey }));
+    await initSupabase(); render(); toast('Ansluten – logga in för att synka');
+  });
+  $('#sbClear') && ($('#sbClear').onclick = () => { localStorage.removeItem(LS_CFG); sb = null; session = null; setSync('local'); render(); });
+  const doAuth = async (kind) => {
+    const email = $('#authEmail').value.trim(), password = $('#authPass').value;
+    if (!email || !password) return toast('Fyll i e-post och lösenord');
+    const fn = kind === 'signup' ? sb.auth.signUp({ email, password }) : sb.auth.signInWithPassword({ email, password });
+    const { data, error } = await fn;
+    if (error) return toast(error.message);
+    if (kind === 'signup' && !data.session) return toast('Konto skapat – bekräfta via mejlet och logga sedan in');
+    toast('Inloggad');
+  };
+  $('#loginBtn') && ($('#loginBtn').onclick = () => doAuth('login'));
+  $('#signupBtn') && ($('#signupBtn').onclick = () => doAuth('signup'));
+  $('#logoutBtn') && ($('#logoutBtn').onclick = async () => { await sb.auth.signOut(); });
+  $('#syncNow') && ($('#syncNow').onclick = () => flush(false).then(render));
+  $('#pullBtn') && ($('#pullBtn').onclick = async () => {
+    if (outbox.length && !confirm(`${plural(outbox.length, 'ändring', 'ändringar')} har inte skickats än och skrivs över. Fortsätt?`)) return;
+    try { await pull(); outbox = []; saveOutbox(); setSync('ok'); render(); toast('Hämtat från databasen'); }
+    catch (e) { toast('Kunde inte hämta: ' + e.message); }
+  });
+  $('#uploadBtn') && ($('#uploadBtn').onclick = () => {
+    if (!confirm(`Ladda upp ${state.entries.length} tidposter och ${state.clients.length} kunder till databasen? Rader med samma id skrivs över.`)) return;
+    uploadAll(); flush(false).then(render);
+  });
+
   // Data
   $('#backupBtn').onclick = () => download(`tidrapport-backup-${todayStr()}.json`, JSON.stringify(state, null, 2), 'application/json');
   $('#importFile').onchange = async (ev) => {
@@ -586,24 +721,10 @@ function renderSettings(v) {
     ev.target.value = '';
   };
   $('#wipeBtn').onclick = () => {
-    if (!confirm('Rensa ALL data i den här webbläsaren? Ta en säkerhetskopia först. Kan inte ångras.')) return;
-    localStorage.removeItem(LS_DATA); state = emptyData(); seedIfEmpty(); persist(); render();
+    if (!confirm('Rensa den lokala kopian i den här webbläsaren? Databasen i Supabase påverkas inte – nästa inloggning hämtar hem allt igen.')) return;
+    localStorage.removeItem(LS_DATA); outbox = []; saveOutbox();
+    state = emptyData(); seedIfEmpty(); render();
   };
-
-  // Synk
-  $('#syncSave').onclick = async () => {
-    const token = $('#syncToken').value.trim(); if (!token) return toast('Ange synknyckeln');
-    localStorage.setItem(LS_SYNC, JSON.stringify({ token }));
-    try {
-      const remote = await syncPull();
-      if (remote?.entries?.length && confirm(`Det finns redan ${remote.entries.length} tidposter i molnet (ändrad ${remote.updated_at ? new Date(remote.updated_at).toLocaleString('sv-SE') : 'okänt'}).\n\nOK = hämta hit dem. Avbryt = skriv över molnet med den här enhetens data.`)) {
-        state = { ...emptyData(), ...remote }; saveLocal(state); toast('Hämtat från molnet');
-      } else { await syncPush(false); }
-      render();
-    } catch (e) { toast(e.message); localStorage.removeItem(LS_SYNC); render(); }
-  };
-  $('#syncNow') && ($('#syncNow').onclick = async () => { try { await syncPush(false); } catch (e) { toast(e.message); } });
-  $('#syncOff') && ($('#syncOff').onclick = () => { localStorage.removeItem(LS_SYNC); render(); toast('Synk avstängd – datan finns kvar lokalt'); });
 }
 
 // ---------- 5. Banner, toast, navigation ----------
@@ -635,7 +756,41 @@ document.addEventListener('click', (e) => {
 function seedIfEmpty() {
   if (state.clients.length === 0) {
     const c = { id: uid(), ...DEFAULT_CLIENT, active: true };
-    state.clients.push(c); ui.clientId = c.id; ui.defaultClientId = c.id; saveUi(); saveLocal(state);
+    state.clients.push(c); ui.clientId = c.id; ui.defaultClientId = c.id; saveUi(); saveLocal();
+  }
+}
+
+async function initSupabase() {
+  const cfg = getCfg();
+  if (!cfg?.url || !cfg?.anonKey || !window.supabase) { sb = null; session = null; setSync('local'); return; }
+  sb = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: true, autoRefreshToken: true } });
+  const { data } = await sb.auth.getSession();
+  session = data.session;
+  sb.auth.onAuthStateChange(async (_evt, s) => {
+    const wasLoggedOut = !session;
+    session = s;
+    if (s && wasLoggedOut) await syncAfterLogin();
+    render();
+  });
+  if (session) await syncAfterLogin();
+}
+
+/** Första synk efter inloggning: skicka köade ändringar, hämta sedan allt. */
+async function syncAfterLogin() {
+  try {
+    await flush();
+    const before = state.entries.length;
+    await pull();
+    // Tomt i molnet men data lokalt? Erbjud uppladdning.
+    if (state.entries.length === 0 && before > 0) {
+      state = loadLocal();
+      if (confirm(`Databasen är tom. Vill du ladda upp dina ${before} lokala tidposter dit?`)) { uploadAll(); await flush(false); }
+    }
+    setSync('ok');
+  } catch (e) {
+    console.error(e);
+    toast('Kunde inte synka: ' + (e.message || e));
+    setSync('pending');
   }
 }
 
@@ -644,16 +799,6 @@ function seedIfEmpty() {
   seedIfEmpty();
   render();
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
-
-  // Hämta nyare data från molnet om synk är påslagen
-  if (syncOn()) {
-    try {
-      const remote = await syncPull();
-      if (remote && (!state.updated_at || (remote.updated_at && remote.updated_at > state.updated_at))) {
-        state = { ...emptyData(), ...remote }; saveLocal(state); render(); toast('Hämtade senaste från molnet');
-      } else if (state.updated_at && (!remote || !remote.updated_at || state.updated_at > remote.updated_at)) {
-        await syncPush();
-      }
-    } catch (e) { toast(e.message); }
-  }
+  await initSupabase();
+  render();
 })();
