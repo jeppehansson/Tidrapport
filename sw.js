@@ -1,6 +1,6 @@
 /* Enkel service worker: nätverk först, cache som reserv (så appen öppnar offline).
    Höj CACHE-versionen när du gjort ändringar om du vill tvinga fram uppdatering. */
-const CACHE = 'tidrapport-v7';
+const CACHE = 'tidrapport-v8';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest', './icons/icon.svg', './icons/melago-logo.png'];
 
 self.addEventListener('install', (e) => {

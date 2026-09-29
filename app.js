@@ -107,8 +107,38 @@ function queue(op) {
   flush();
 }
 
+/** Byter ett kund-id överallt lokalt – i datan, i kön och i UI-valen. */
+function remapClientId(from, to) {
+  for (const c of state.clients) if (c.id === from) c.id = to;
+  state.clients = state.clients.filter((c, i, arr) => arr.findIndex((x) => x.id === c.id) === i);
+  for (const list of [state.projects, state.entries, state.invoices]) for (const x of list) if (x.client_id === from) x.client_id = to;
+  for (const op of outbox) {
+    if (op.row?.client_id === from) op.row.client_id = to;
+    if (op.t === 'clients' && op.row?.id === from) op.row.id = to;
+    if (op.t === 'clients' && op.id === from) op.id = to;
+  }
+  if (ui.clientId === from) ui.clientId = to;
+  if (ui.defaultClientId === from) ui.defaultClientId = to;
+  saveLocal(); saveOutbox(); saveUi();
+}
+
+/** Ser till att kunden (och ev. projektet) som en rad pekar på finns i molnet.
+    Finns en kund med samma namn där redan tas dess id över lokalt, annars laddas den lokala upp. */
+async function ensureParents(row) {
+  const c = clientById(row.client_id);
+  if (!c) throw new Error(`Kunden för posten ${row.date ?? row.month ?? row.name ?? row.id} finns inte längre lokalt`);
+  const { data: same, error } = await sb.from('clients').select('id').ilike('name', c.name.trim()).limit(1);
+  if (error) throw error;
+  if (same?.[0]?.id) { if (same[0].id !== c.id) remapClientId(c.id, same[0].id); }
+  else { const { error: e2 } = await sb.from('clients').upsert(clientRow(c)); if (e2) throw e2; }
+  if (row.project_id) {
+    const p = projectById(row.project_id);
+    if (p) { const { error: e3 } = await sb.from('projects').upsert(projectRow(p)); if (e3) throw e3; }
+  }
+}
+
 /** Skickar en kö-post till Supabase. */
-async function applyOp(op) {
+async function applyOp(op, retried = false) {
   if (op.a === 'del') {
     const { error } = await sb.from(op.t).delete().eq('id', op.id);
     if (error) throw error;
@@ -116,6 +146,13 @@ async function applyOp(op) {
   }
   const { error } = await sb.from(op.t).upsert(op.row);
   if (!error) return;
+
+  // Kunden/projektet saknas i molnet (t.ex. standardkunden som bara skapats lokalt
+  // i den här webbläsaren). Skapa eller koppla ihop den och försök igen.
+  if (!retried && op.row?.client_id && (error.code === '23503' || /foreign key/i.test(error.message || ''))) {
+    await ensureParents(op.row);
+    return applyOp(op, true);
+  }
 
   // Krock på unik-index: samma dag/kund/projekt finns redan i molnet med ett
   // annat id (kan hända om två enheter skapat samma dag var för sig).
