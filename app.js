@@ -95,6 +95,7 @@ const saveOutbox = () => { try { localStorage.setItem(LS_OUTBOX, JSON.stringify(
 let sb = null;          // Supabase-klient
 let session = null;     // inloggad session
 let flushing = false;
+let lastSyncError = null;
 let syncState = 'local';  // 'local' | 'ok' | 'pending' | 'offline' | 'error'
 
 const cloudReady = () => !!(sb && session);
@@ -138,34 +139,41 @@ async function applyOp(op) {
   throw error;
 }
 
+/** Avbryter ett anrop som hänger sig, så att synken aldrig fastnar för gott. */
+const withTimeout = (promise, ms = 15000, what = 'Anropet') =>
+  Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} tog för lång tid (${ms / 1000}s)`)), ms))]);
+
 /** Tömmer kön mot Supabase. Körs efter varje ändring, vid start och när nätet kommer tillbaka. */
 async function flush(silent = true) {
-  if (!cloudReady() || flushing) return;
+  if (!cloudReady()) return;
+  if (flushing) { if (!silent) toast('En synk pågår redan'); return; }
   if (!navigator.onLine) { setSync('offline'); return; }
-  if (outbox.length === 0) { setSync('ok'); return; }
+  if (outbox.length === 0) { lastSyncError = null; setSync('ok'); return; }
   flushing = true;
   try {
     while (outbox.length) {
-      await applyOp(outbox[0]);
+      await withTimeout(applyOp(outbox[0]), 15000, 'Synken');
       outbox.shift(); saveOutbox(); updateSyncPill();
     }
+    lastSyncError = null;
     setSync('ok');
     if (!silent) toast('Synkat med Supabase');
   } catch (e) {
     console.error(e);
+    lastSyncError = e.message || String(e);
     setSync('pending');
-    if (!silent) toast('Kunde inte synka: ' + (e.message || e));
+    if (!silent) toast('Kunde inte synka: ' + lastSyncError);
   } finally { flushing = false; }
 }
 
 /** Hämtar allt från Supabase och ersätter den lokala cachen. */
 async function pull() {
-  const [c, p, e, i] = await Promise.all([
+  const [c, p, e, i] = await withTimeout(Promise.all([
     sb.from('clients').select('*').order('name'),
     sb.from('projects').select('*').order('name'),
     sb.from('entries').select('*').order('date'),
     sb.from('invoices').select('*'),
-  ]);
+  ]), 20000, 'Hämtningen');
   for (const r of [c, p, e, i]) if (r.error) throw r.error;
   state = {
     clients: c.data.map((x) => ({ ...x, hourly_rate: Number(x.hourly_rate) })),
@@ -638,6 +646,7 @@ function renderSettings(v) {
         <button class="btn" id="pullBtn">Hämta från databasen</button>
         <button class="btn ghost" id="uploadBtn">Ladda upp allt lokalt</button>
       </div>
+      ${lastSyncError ? `<div class="banner warn small" style="margin:0"><div class="grow"><b>Senaste synkfel:</b><br>${esc(lastSyncError)}</div></div>` : ''}
       <p class="small muted" style="margin:0">Timmarna sparas direkt i mobilen och skickas till databasen i bakgrunden – du kan registrera utan täckning och det synkas när du får nät igen.</p>
     `}
   </div>
@@ -760,6 +769,7 @@ function download(name, content, type) {
 }
 
 document.addEventListener('click', (e) => {
+  if (e.target.id === 'syncStatus') { ui.tab = 'settings'; saveUi(); render(); window.scrollTo(0, 0); return; }
   const go = e.target.closest('[data-go]'); if (go) { ui.tab = go.dataset.go; saveUi(); render(); window.scrollTo(0, 0); }
   const tab = e.target.closest('.tab'); if (tab) { ui.tab = tab.dataset.tab; saveUi(); render(); window.scrollTo(0, 0); }
 });
@@ -778,30 +788,44 @@ async function initSupabase() {
   sb = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: true, autoRefreshToken: true } });
   const { data } = await sb.auth.getSession();
   session = data.session;
-  sb.auth.onAuthStateChange(async (_evt, s) => {
+  sb.auth.onAuthStateChange((_evt, s) => {
     const wasLoggedOut = !session;
     session = s;
-    if (s && wasLoggedOut) await syncAfterLogin();
     render();
+    // OBS: anrop mot Supabase får INTE göras direkt i den här callbacken –
+    // klienten håller ett lås under den och synken skulle låsa sig.
+    if (s && wasLoggedOut) setTimeout(() => syncAfterLogin().then(render), 0);
   });
   if (session) await syncAfterLogin();
 }
 
 /** Första synk efter inloggning: skicka köade ändringar, hämta sedan allt. */
 async function syncAfterLogin() {
+  const snapshot = JSON.parse(JSON.stringify(state));   // säkerhetskopia i minnet
   try {
     await flush();
-    const before = state.entries.length;
-    await pull();
-    // Tomt i molnet men data lokalt? Erbjud uppladdning.
-    if (state.entries.length === 0 && before > 0) {
-      state = loadLocal();
-      if (confirm(`Databasen är tom. Vill du ladda upp dina ${before} lokala tidposter dit?`)) { uploadAll(); await flush(false); }
+    // Gick kön inte iväg? Hämta då INTE – det skulle skriva över osänt arbete.
+    if (outbox.length) {
+      toast(`${plural(outbox.length, 'ändring', 'ändringar')} kunde inte skickas – hämtar inte från databasen`);
+      setSync('pending');
+      return;
     }
-    setSync('ok');
+    const before = snapshot.entries.length;
+    await pull();
+    // Tomt i molnet men data lokalt? Lägg tillbaka det lokala och erbjud uppladdning.
+    if (state.entries.length === 0 && before > 0) {
+      state = snapshot; saveLocal(); render();
+      if (confirm(`Databasen är tom men du har ${before} tidposter i den här webbläsaren.\n\nOK = ladda upp dem till databasen.`)) {
+        uploadAll(); await flush(false);
+      }
+    }
+    setSync(outbox.length ? 'pending' : 'ok');
   } catch (e) {
     console.error(e);
-    toast('Kunde inte synka: ' + (e.message || e));
+    // Återställ det lokala om något gick fel mitt i
+    state = snapshot; saveLocal();
+    lastSyncError = e.message || String(e);
+    toast('Kunde inte synka: ' + lastSyncError);
     setSync('pending');
   }
 }

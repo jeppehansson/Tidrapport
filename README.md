@@ -113,6 +113,24 @@ Lägg till din Netlify-adress under **Authentication → URL Configuration** i S
 Stör "Powered by Netlify"-badgen längst ned till höger? Stäng av den under
 **Project configuration → General → Powered by Netlify badge**.
 
+## Felsökning: timmarna syns inte på andra enheten
+
+Kolla statusrutan uppe till höger på **den enhet där timmarna finns**:
+
+| Står det | Gör så här |
+|---|---|
+| `Lokalt` | Supabase är inte konfigurerad här – fyll i URL och nyckel under Inställningar |
+| `Ej inloggad` | Logga in med ditt konto |
+| `Väntar (n)` | Ändringar ligger i kö – tryck **Synka nu** under Inställningar. Står felet kvar visas orsaken i rutan *Senaste synkfel* |
+| `Synkad` | Allt är uppe. Ser du dem ändå inte på den andra enheten: kontrollera att båda är inloggade med **samma** e-post |
+
+Verifiera i Supabase: **Table Editor → entries**. Finns raderna där är problemet på den
+hämtande enheten – tryck **Hämta från databasen** under Inställningar där.
+
+Ordningen spelar roll första gången: ladda upp från enheten som har timmarna **först**,
+hämta sedan på den andra. Svarar du nej på frågan "Databasen är tom men du har N tidposter"
+ligger de kvar lokalt och du kan ladda upp dem när som helst med **Ladda upp allt lokalt**.
+
 ## 5. Anpassa
 
 - **Förkonfigurerad Supabase**: `SUPABASE_URL` och `SUPABASE_KEY` högst upp i `app.js`.
