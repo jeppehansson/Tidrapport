@@ -296,6 +296,12 @@ function saveEntry({ date, client_id, project_id, hours, note }) {
   saveLocal(); queue({ t: 'entries', a: 'up', row: entryRow(e) });
   toast(`Sparat ${fmtHours(hours)} – ${longDate(date)}`);
 }
+function deleteEntry(id) {
+  const e = state.entries.find((x) => x.id === id); if (!e) return;
+  state.entries = state.entries.filter((x) => x.id !== id);
+  saveLocal(); queue({ t: 'entries', a: 'del', id });
+  toast(`Tog bort ${fmtHours(e.hours)} – ${longDate(e.date)}`);
+}
 function upsertClient(c) {
   const i = state.clients.findIndex((x) => x.id === c.id);
   if (i >= 0) state.clients[i] = c; else state.clients.push(c);
@@ -401,6 +407,8 @@ function renderToday(v) {
   const weekDays = [...Array(7)].map((_, i) => fmtDate(addDays(ws, i)));
   const weekEntries = entriesFor((e) => e.client_id === client.id && weekDays.includes(e.date));
   const monthEntries = entriesFor((e) => e.client_id === client.id && monthKey(e.date) === monthKey(ui.date));
+  const dayEntries = entriesFor((e) => e.date === ui.date && e.client_id === client.id);
+  const projectLabel = (e) => (e.project_id ? projectById(e.project_id)?.name ?? 'Okänt projekt' : 'Inget projekt');
 
   v.innerHTML = `
   <div class="card stack">
@@ -428,7 +436,16 @@ function renderToday(v) {
       <button class="chip" data-h="0">Ledig</button>
     </div>
     <label class="field">Notering (valfritt)<input id="noteInput" placeholder="t.ex. workshop, resa" value="${esc(existing?.note ?? '')}" /></label>
-    <button class="btn primary block" id="saveBtn">Spara</button>
+    ${existing ? `<div class="grid-2"><button class="btn primary block" id="saveBtn">Spara</button><button class="btn danger block" id="deleteBtn">Ta bort</button></div>` : '<button class="btn primary block" id="saveBtn">Spara</button>'}
+    ${dayEntries.length ? `<div>
+      <div class="small muted">Registrerat ${longDate(ui.date)} · ${fmtHours(sumHours(dayEntries))}</div>
+      <div class="list">${dayEntries.map((e) => `<div class="list-item ${e === existing ? 'today' : ''}">
+        <div><div class="title small">${esc(projectLabel(e))}</div>${e.note ? `<div class="sub">${esc(e.note)}</div>` : ''}</div>
+        <div class="row"><span class="value">${fmtHours(e.hours)}</span>
+          ${e === existing ? '' : `<button class="btn sm ghost" data-eedit="${e.id}" title="Ändra">Ändra</button>`}
+          <button class="btn sm ghost" data-edel="${e.id}" title="Ta bort" aria-label="Ta bort">✕</button></div>
+      </div>`).join('')}</div>
+    </div>` : ''}
     ${existing?.reported_at ? `<div class="small muted">Rapporterad i Kleer ${new Date(existing.reported_at).toLocaleDateString('sv-SE')}. Ändringar här påverkar inte Kleer.</div>` : ''}
   </div>
 
@@ -469,6 +486,13 @@ function renderToday(v) {
     saveEntry({ date: ui.date, client_id: client.id, project_id: projectId, hours: hoursInput.value, note: $('#noteInput').value.trim() });
     render();
   };
+  const confirmDelete = (e) => {
+    if (!confirm(`Ta bort ${fmtHours(e.hours)} på ${projectLabel(e)} – ${longDate(e.date)}?${e.reported_at ? '\n\nPosten är redan rapporterad i Kleer – ta bort den där också.' : ''}`)) return;
+    deleteEntry(e.id); render();
+  };
+  $('#deleteBtn') && ($('#deleteBtn').onclick = () => confirmDelete(existing));
+  $$('[data-edel]').forEach((b) => (b.onclick = () => confirmDelete(state.entries.find((x) => x.id === b.dataset.edel))));
+  $$('[data-eedit]').forEach((b) => (b.onclick = () => { ui.projectId = state.entries.find((x) => x.id === b.dataset.eedit)?.project_id || null; saveUi(); render(); }));
 }
 
 /* --- Rapportera (Kleer) --- */
